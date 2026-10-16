@@ -1,0 +1,156 @@
+name: Deploy
+
+on:
+  push:
+    branches: [week*]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/typecheck.yaml
+
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: back
+            needs_api_url: false
+          - service: front
+            needs_api_url: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          DOCKER_PASS: ${{ secrets.DOCKER_PASS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DOCKER_PASS" | docker login --username "$DOCKER_USER" --password-stdin
+
+      - name: Build and push ${{ matrix.service }}
+        env:
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          SERVICE: ${{ matrix.service }}
+          NEEDS_API_URL: ${{ matrix.needs_api_url }}
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          image="$DOCKER_USER/todo-$SERVICE"
+          if [ "$NEEDS_API_URL" = "true" ]; then
+            test -n "$VITE_API_URL"
+            docker build --platform linux/amd64 \
+              --build-arg "VITE_API_URL=$VITE_API_URL" \
+              -t "$image:sha-$COMMIT_SHA" -t "$image:latest" "$SERVICE"
+          else
+            docker build --platform linux/amd64 \
+              -t "$image:sha-$COMMIT_SHA" -t "$image:latest" "$SERVICE"
+          fi
+          docker push "$image:sha-$COMMIT_SHA"
+          docker push "$image:latest"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy images to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -eu
+            cd ~/myapp
+            grep -q '^APP_VERSION=' .env.development.compose
+            sed -i 's|^APP_VERSION=.*|APP_VERSION=sha-${{ github.sha }}|' .env.development.compose
+            docker compose --env-file .env.development.compose pull back front
+            docker compose --env-file .env.development.compose up -d --no-deps back front
+
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Smoke check deployed version
+        env:
+          API_URL: ${{ vars.VITE_API_URL }}
+          EXPECTED_VERSION: sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$API_URL" == https://*/api ]] || {
+            echo "VITE_API_URL must be an HTTPS URL ending in /api"
+            exit 1
+          }
+          export E2E_BASE_URL="${API_URL%/api}"
+          for attempt in 1 2 3 4 5 6; do
+            if bash scripts/smoke.sh; then
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "Smoke check failed after six attempts"
+              exit 1
+            fi
+            sleep 5
+          done
+          health_json="$(curl --fail --silent --show-error --max-time 10 "$E2E_BASE_URL/api/health")"
+          HEALTH_JSON="$health_json" python3 - "$EXPECTED_VERSION" <<'PY'
+          import json
+          import os
+          import sys
+
+          actual = json.loads(os.environ["HEALTH_JSON"]).get("version")
+          expected = sys.argv[1]
+          if actual != expected:
+              raise SystemExit(f"Expected deployed version {expected}, got {actual}")
+          print(f"Deployed version verified: {actual}")
+          PY
+
+  notify:
+    needs: [checks, build, deploy, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Telegram
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          if [ "$CHECKS_RESULT" != "success" ]; then
+            subject="❌ Type-check упал"
+          elif [ "$BUILD_RESULT" != "success" ]; then
+            subject="❌ Build упал"
+          elif [ "$DEPLOY_RESULT" != "success" ]; then
+            subject="❌ Deploy упал"
+          elif [ "$VERIFY_RESULT" != "success" ]; then
+            subject="❌ Smoke-проверка не прошла"
+          else
+            subject="✅ Деплой успешен"
+          fi
+          message="$(printf '%s\n%s @ %s\nАвтор: %s\nВерсия: sha-%s\n%s' \
+            "$subject" "$REPOSITORY" "$REF_NAME" "$ACTOR" "$COMMIT_SHA" "$RUN_URL")"
+          response="$(curl --fail-with-body --silent --show-error \
+            --request POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+            --data-urlencode "text=$message" \
+            --data-urlencode "disable_web_page_preview=true")"
+          python3 -c 'import json, sys; response = json.load(sys.stdin); sys.exit(0 if response.get("ok") is True else 1)' <<< "$response"
+          echo '{"ok":true}'
